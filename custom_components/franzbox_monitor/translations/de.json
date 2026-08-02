@@ -1,0 +1,53 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "FRANZ!Box Monitor",
+        "description": "Der Call-Monitor muss an der FRITZ!Box einmalig freigeschaltet werden: von einem angeschlossenen Telefon `#96*5*` wählen. Benutzername und Passwort werden nur für die Namensauflösung über das Telefonbuch benötigt.",
+        "data": {
+          "host": "Host",
+          "username": "Benutzername",
+          "password": "Passwort",
+          "history_length": "Länge der Anrufhistorie"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Der Call-Monitor ist auf Port 1012 nicht erreichbar. Bitte an der FRITZ!Box `#96*5*` wählen und den Host prüfen.",
+      "invalid_auth": "Benutzername oder Passwort für die FRITZ!Box ist falsch."
+    },
+    "abort": {
+      "already_configured": "Diese FRITZ!Box ist bereits eingerichtet."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "FRANZ!Box Monitor",
+        "description": "Nach einer Änderung lädt sich die Integration automatisch neu.",
+        "data": {
+          "host": "Host",
+          "username": "Benutzername",
+          "password": "Passwort",
+          "history_length": "Länge der Anrufhistorie"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Der Call-Monitor ist auf Port 1012 nicht erreichbar. Bitte an der FRITZ!Box `#96*5*` wählen und den Host prüfen.",
+      "invalid_auth": "Benutzername oder Passwort für die FRITZ!Box ist falsch."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "call_status": {
+        "state": {
+          "idle": "Frei",
+          "ringing": "Klingelt",
+          "dialing": "Wählt",
+          "talking": "Im Gespräch"
+        }
+      }
+    }
+  }
+}

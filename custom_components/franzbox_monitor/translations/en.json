@@ -1,0 +1,53 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "FRANZ!Box Monitor",
+        "description": "The call monitor must be enabled once on the FRITZ!Box by dialling `#96*5*` from a connected phone. Username and password are only needed to resolve numbers against the phone book.",
+        "data": {
+          "host": "Host",
+          "username": "Username",
+          "password": "Password",
+          "history_length": "Number of calls to keep"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot reach the call monitor on port 1012. Enable it on the FRITZ!Box by dialling `#96*5*` and check the host.",
+      "invalid_auth": "Invalid username or password for the FRITZ!Box."
+    },
+    "abort": {
+      "already_configured": "This FRITZ!Box is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "FRANZ!Box Monitor",
+        "description": "Changing a value reloads the integration.",
+        "data": {
+          "host": "Host",
+          "username": "Username",
+          "password": "Password",
+          "history_length": "Number of calls to keep"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot reach the call monitor on port 1012. Enable it on the FRITZ!Box by dialling `#96*5*` and check the host.",
+      "invalid_auth": "Invalid username or password for the FRITZ!Box."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "call_status": {
+        "state": {
+          "idle": "Idle",
+          "ringing": "Ringing",
+          "dialing": "Dialing",
+          "talking": "In call"
+        }
+      }
+    }
+  }
+}
