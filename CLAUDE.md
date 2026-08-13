@@ -79,6 +79,34 @@ Zentrale Punkte:
   ruft registrierte Listener auf. `add_listener()` gibt eine Abmeldefunktion zurück.
 - **Reconnect** mit gestaffelten Wartezeiten (`RECONNECT_DELAYS = [5, 10, 30, 60]`), der
   letzte Wert wiederholt sich. Nach erfolgreicher Verbindung wird der Index zurückgesetzt.
+- **Ein stiller Verbindungsabbruch ist der Normalfall, nicht die Ausnahme.** Der
+  Call-Monitor sendet nur bei Anrufen etwas — zwischen zwei Anrufen fließt tagelang kein
+  Byte, es gibt kein Lebenszeichen. Stirbt die Verbindung in dieser Zeit weg (Box neu
+  gestartet, Router hat den NAT-Eintrag verworfen, WLAN-Aussetzer), kommt **weder EOF noch
+  Fehler** an: `readline()` wartet für immer auf Daten, die nie kommen, die
+  Reconnect-Schleife wird nie erreicht. Symptom war genau das — alles läuft, nach einiger
+  Zeit erscheinen neue Anrufe nicht mehr, ein Reload der Integration hilft sofort. Dagegen
+  stehen jetzt zwei Ebenen, **beide nötig**: TCP-Keepalive am Socket
+  (`_enable_tcp_keepalive()`, greift nach ~90 s) und ein Idle-Timeout um `readline()`
+  (`IDLE_RECONNECT_SECONDS = 3600`) für den Fall, dass die Box bei technisch lebendem TCP
+  verstummt. Der Idle-Timeout löst **nicht** aus, solange `_open_connections` gefüllt ist —
+  ein laufendes Gespräch erzeugt selbst keine Zeilen, ein Reconnect würde dessen
+  `DISCONNECT` verschlucken. Diese Menge führt der Client selbst und leert sie bei jedem
+  Verbindungsaufbau; sie kann also nicht dauerhaft verwaisen.
+- **Die Verbindungsschleife fängt auch `Exception`.** Vorher waren es nur `OSError`-Ableger:
+  jeder andere Fehler tötete den Hintergrund-Task lautlos, und die Integration war bis zum
+  nächsten Reload taub — dasselbe Symptom, das der Reconnect gerade verhindern soll.
+  `CancelledError` wird davor durchgereicht, sonst hängt das Entladen.
+- **Nach jedem Reconnect muss Zustand verworfen werden.** `add_connection_listener()` meldet
+  den (Neu-)Aufbau; der Sensor räumt daraufhin `_connection_states` und schließt über
+  `_close_orphaned_entries()` alle Einträge mit `outcome == "laufend"`. Ohne das bliebe der
+  Sensor nach einem Abbruch mitten im Gespräch für immer auf `talking` stehen, und
+  `_find_open_entry()` würde den verwaisten Eintrag beim nächsten Anruf mit der recycelten
+  Connection-ID (fast immer `0`) als Ziel des `DISCONNECT` missverstehen. Dieselbe
+  Aufräumung läuft in `async_added_to_hass()` — ein HA-Neustart mitten im Gespräch
+  hinterlässt denselben Müll. Der Rückruf feuert **synchron**, nicht als Task: er muss fertig
+  sein, bevor die erste Zeile der neuen Verbindung verarbeitet wird, sonst räumt er einen
+  gerade angelegten Eintrag mit weg.
 - **Bus-Events werden in `__init__.py` gefeuert, nicht in der Entity.** Ein zweiter `RING`
   bei unverändertem Sensorzustand würde als State-Trigger verloren gehen; das Event
   beschreibt außerdem die Integration, nicht eine einzelne Entity.
