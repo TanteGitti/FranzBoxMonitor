@@ -248,10 +248,21 @@ class FranzBoxCallHistorySensor(SensorEntity):
         # Rückwirkende Anreicherung bereits gespeicherter Einträge,
         # z.B. aus der Zeit vor Anbindung des Telefonbuchs
         changed = self._enrich_history_with_names()
+        # Wurde HA mitten im Gespräch beendet, steht dessen Eintrag noch auf
+        # 'laufend'. Das DISCONNECT dazu kommt nie mehr - der Eintrag muss also
+        # jetzt geschlossen werden, sonst greift ihn _find_open_entry() beim
+        # nächsten Anruf mit derselben (recycelten) Connection-ID ab.
+        changed = self._close_orphaned_entries() or changed
         if changed:
             self._async_save_history()
 
         self._remove_listener = self._client.add_listener(self._handle_call_event)
+
+        # Nach jedem Neuaufbau der Verbindung dasselbe Aufräumen: was während
+        # der Unterbrechung passiert ist, erfahren wir nie.
+        self.async_on_remove(
+            self._client.add_connection_listener(self._handle_reconnected)
+        )
 
         # Auf ein neu geladenes Telefonbuch reagieren (Knopfdruck oder der
         # 12-Stunden-Turnus), um die Namen in der gespeicherten Historie
@@ -270,6 +281,72 @@ class FranzBoxCallHistorySensor(SensorEntity):
             self._remove_listener()
 
     @callback
+    def _handle_reconnected(self) -> None:
+        """Die Verbindung zum Call-Monitor wurde (neu) aufgebaut.
+
+        Der Call-Monitor sendet nichts nach: ein DISCONNECT, das während der
+        Unterbrechung gefallen ist, ist für uns verloren. Ohne Aufräumen bliebe
+        die Verbindung in _connection_states stehen, der Sensor stünde für
+        immer auf 'talking' und würde nie wieder 'idle' - und der offene
+        Historieneintrag würde beim nächsten Anruf mit derselben, von der
+        Fritzbox wiederverwendeten Connection-ID (meist '0') als Ziel des
+        DISCONNECT missverstanden.
+        """
+        if not self._connection_states and not any(
+            entry_dict.get("outcome") == OUTCOME_ONGOING
+            for entry_dict in self._history
+        ):
+            return
+
+        _LOGGER.debug(
+            "Verbindung neu aufgebaut - %d laufende Verbindung(en) verworfen",
+            len(self._connection_states),
+        )
+        self._connection_states.clear()
+        self._close_orphaned_entries()
+        self._attr_native_value = self._current_state()
+
+        self._async_save_history()
+        self.async_write_ha_state()
+
+    def _close_orphaned_entries(self) -> bool:
+        """Schließt Historieneinträge, deren DISCONNECT nie ankommen wird.
+
+        Betrifft zwei Fälle: einen HA-Neustart mitten im Gespräch und einen
+        Reconnect des Call-Monitors. In beiden ist die Dauer unbekannt - der
+        Eintrag bekommt deshalb 0 Sekunden und das Ergebnis, das sich aus dem
+        bereits Bekannten ergibt. Ein 'laufend' stehenzulassen wäre die
+        schlechtere Wahl: _find_open_entry() würde ihn später fälschlich
+        treffen.
+
+        Gibt True zurück, wenn etwas geändert wurde (dann speichern).
+        """
+        changed = False
+        for entry_dict in self._history:
+            if entry_dict.get("outcome") != OUTCOME_ONGOING:
+                continue
+
+            if entry_dict.get("duration_seconds") is None:
+                entry_dict["duration_seconds"] = 0
+            entry_dict["outcome"] = self._final_outcome(entry_dict)
+            changed = True
+
+        return changed
+
+    @staticmethod
+    def _final_outcome(entry_dict: dict[str, Any]) -> str:
+        """Ergebnis eines beendeten Anrufs aus dem, was am Eintrag steht.
+
+        Ohne die 'blockiert'-Heuristik: die braucht den Zeitpunkt des
+        DISCONNECT, und genau der fehlt hier (siehe _handle_call_disconnect).
+        """
+        if entry_dict.get("answered"):
+            return OUTCOME_ANSWERED
+        if entry_dict.get("direction") == DIRECTION_IN:
+            return OUTCOME_MISSED
+        return OUTCOME_UNREACHED
+
+    @callback
     def _handle_phonebook_updated(self) -> None:
         """Das Telefonbuch wurde neu geladen: Namen in der Historie auffrischen."""
         if not self._enrich_history_with_names():
@@ -278,8 +355,10 @@ class FranzBoxCallHistorySensor(SensorEntity):
         self._async_save_history()
         self.async_write_ha_state()
 
-    @staticmethod
-    def _normalize_entry(entry_dict: dict[str, Any]) -> dict[str, Any]:
+    # classmethod statt staticmethod, damit _final_outcome() mitbenutzt werden
+    # kann - die Regel "wie endete dieser Anruf" soll nur an einer Stelle stehen.
+    @classmethod
+    def _normalize_entry(cls, entry_dict: dict[str, Any]) -> dict[str, Any]:
         """Ergänzt fehlende Schlüssel an einem gespeicherten Historieneintrag.
 
         Einträge aus älteren Versionen kennen z.B. 'partner_number' oder
@@ -313,12 +392,7 @@ class FranzBoxCallHistorySensor(SensorEntity):
             normalized["outcome"] == OUTCOME_ONGOING
             and normalized["duration_seconds"] is not None
         ):
-            if normalized["answered"]:
-                normalized["outcome"] = OUTCOME_ANSWERED
-            else:
-                normalized["outcome"] = (
-                    OUTCOME_MISSED if incoming else OUTCOME_UNREACHED
-                )
+            normalized["outcome"] = cls._final_outcome(normalized)
 
         return normalized
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from datetime import datetime
 from typing import Callable
 
@@ -21,6 +22,20 @@ RECONNECT_DELAYS = [5, 10, 30, 60]
 # wartet im Einrichtungsdialog darauf.
 TEST_CONNECT_TIMEOUT = 5
 
+# TCP-Keepalive für die stehende Verbindung: nach KEEPALIVE_IDLE Sekunden ohne
+# Verkehr sendet der Kernel Prüfpakete und gibt nach KEEPALIVE_COUNT
+# erfolglosen Versuchen im Abstand von KEEPALIVE_INTERVAL auf - der Socket
+# schlägt dann mit einem Fehler fehl, statt stumm weiterzuwarten.
+KEEPALIVE_IDLE = 60
+KEEPALIVE_INTERVAL = 10
+KEEPALIVE_COUNT = 3
+
+# Zweite Absicherung neben dem Keepalive: kommt so lange keine einzige Zeile,
+# gilt die Verbindung als tot und wird neu aufgebaut. Großzügig bemessen, denn
+# im Normalbetrieb schweigt der Call-Monitor die meiste Zeit - er meldet nur
+# Anrufe, kein Lebenszeichen.
+IDLE_RECONNECT_SECONDS = 3600
+
 
 async def async_test_connection(host: str, port: int = DEFAULT_PORT) -> None:
     """Prüft, ob der Call-Monitor erreichbar ist.
@@ -38,6 +53,42 @@ async def async_test_connection(host: str, port: int = DEFAULT_PORT) -> None:
         if writer is not None:
             writer.close()
             await writer.wait_closed()
+
+
+def _enable_tcp_keepalive(writer: asyncio.StreamWriter) -> None:
+    """Schaltet TCP-Keepalive für die offene Verbindung ein.
+
+    Der Call-Monitor sendet von sich aus nur bei Anrufen etwas - zwischen zwei
+    Anrufen fließt tagelang kein Byte. Bricht die Verbindung in dieser Zeit
+    still weg (Fritzbox neu gestartet, Router hat den NAT-Eintrag verworfen,
+    WLAN-Aussetzer), kommt weder ein FIN noch ein Fehler an: der Socket sieht
+    für uns aus wie eine gesunde, ruhige Verbindung, und readline() wartet für
+    immer. Mit Keepalive prüft der Kernel selbst nach und der nächste Lesezugriff
+    schlägt nach rund KEEPALIVE_IDLE + KEEPALIVE_COUNT * KEEPALIVE_INTERVAL
+    Sekunden fehl - damit greift die Reconnect-Schleife.
+
+    Die TCP_KEEP*-Feineinstellungen gibt es nur auf Linux (dort läuft HA).
+    Fehlen sie, bleibt es bei SO_KEEPALIVE mit der Systemvorgabe - das sind
+    üblicherweise 2 Stunden, immer noch besser als nie.
+    """
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for option_name, value in (
+            ("TCP_KEEPIDLE", KEEPALIVE_IDLE),
+            ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL),
+            ("TCP_KEEPCNT", KEEPALIVE_COUNT),
+        ):
+            option = getattr(socket, option_name, None)
+            if option is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, option, value)
+    except OSError as err:
+        # Keepalive ist eine Absicherung, kein Muss: der Idle-Timeout in
+        # _async_read_loop fängt den Fall ohnehin ab, nur später.
+        _LOGGER.debug("TCP-Keepalive konnte nicht gesetzt werden: %s", err)
 
 
 class CallEvent:
@@ -142,10 +193,16 @@ class FranzBoxCallMonitorClient:
         self._port: int = DEFAULT_PORT
 
         self._listeners: list[Callable[[CallEvent], None]] = []
+        self._connection_listeners: list[Callable[[], None]] = []
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._listen_task: asyncio.Task | None = None
         self._stopping = False
+
+        # Verbindungen, zu denen wir ein RING/CALL, aber noch kein DISCONNECT
+        # gesehen haben. Nur dafür da, den Idle-Reconnect zu verschieben,
+        # solange tatsächlich ein Gespräch läuft (siehe _async_read_loop).
+        self._open_connections: set[str] = set()
 
     def add_listener(
         self, callback: Callable[[CallEvent], None]
@@ -155,6 +212,23 @@ class FranzBoxCallMonitorClient:
 
         def remove_listener() -> None:
             self._listeners.remove(callback)
+
+        return remove_listener
+
+    def add_connection_listener(
+        self, callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        """Registriert einen Rückruf für "Verbindung (neu) aufgebaut".
+
+        Getrennt von add_listener, weil es kein Ereignis der Fritzbox ist,
+        sondern eines von uns: was während der Unterbrechung passierte, sendet
+        der Call-Monitor nicht nach. Wer Zustand über Ereignisse hinweg führt,
+        muss ihn hier verwerfen (siehe sensor.py).
+        """
+        self._connection_listeners.append(callback)
+
+        def remove_listener() -> None:
+            self._connection_listeners.remove(callback)
 
         return remove_listener
 
@@ -176,9 +250,26 @@ class FranzBoxCallMonitorClient:
             except asyncio.CancelledError:
                 pass
 
-        if self._writer is not None:
-            self._writer.close()
-            await self._writer.wait_closed()
+        await self._async_close_connection()
+
+    async def _async_close_connection(self) -> None:
+        """Schließt den Socket, falls einer offen ist.
+
+        Läuft auch bei jedem Reconnect: ohne das bliebe pro Verbindungsverlust
+        ein Writer (und damit ein Socket) liegen.
+        """
+        writer, self._writer = self._writer, None
+        self._reader = None
+
+        if writer is None:
+            return
+
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError as err:
+            # Beim Aufräumen einer ohnehin kaputten Verbindung ohne Belang
+            _LOGGER.debug("Fehler beim Schließen der Verbindung: %s", err)
 
     async def _async_connect_loop(self) -> None:
         """Verbindet sich mit dem Call-Monitor und versucht bei Verbindungs-
@@ -195,17 +286,37 @@ class FranzBoxCallMonitorClient:
                 self._reader, self._writer = await asyncio.open_connection(
                     self._host, self._port
                 )
+                _enable_tcp_keepalive(self._writer)
                 _LOGGER.debug(
                     "Verbunden mit dem Call-Monitor %s:%s", self._host, self._port
                 )
                 delay_index = 0  # Verbindung stand -> Backoff zurücksetzen
+                # Was während einer Unterbrechung lief, ist für uns verloren -
+                # der Call-Monitor sendet nichts nach. Also mit leerem Zustand
+                # weitermachen, statt Verbindungen ewig als offen zu führen.
+                self._open_connections.clear()
+                self._notify_connected()
                 await self._async_read_loop()
 
-            except (ConnectionError, OSError) as err:
+            except asyncio.CancelledError:
+                # Kommt von async_stop - muss durch, sonst hängt das Entladen
+                raise
+            except OSError as err:
+                # ConnectionError und TimeoutError erben beide von OSError
                 _LOGGER.warning(
                     "Verbindung zum Call-Monitor verloren oder fehlgeschlagen: %s",
                     err,
                 )
+            except Exception:  # noqa: BLE001
+                # Ohne diesen Fangarm stirbt der Task bei jedem unerwarteten
+                # Fehler lautlos, und die Integration ist bis zum nächsten
+                # Reload taub - genau das Symptom, das der Reconnect vermeiden
+                # soll. Lieber weiterlaufen und den Fehler protokollieren.
+                _LOGGER.exception(
+                    "Unerwarteter Fehler in der Call-Monitor-Verbindung"
+                )
+            finally:
+                await self._async_close_connection()
 
             if self._stopping:
                 break
@@ -222,7 +333,28 @@ class FranzBoxCallMonitorClient:
         assert self._reader is not None
 
         while not self._stopping:
-            raw_line = await self._reader.readline()
+            try:
+                raw_line = await asyncio.wait_for(
+                    self._reader.readline(), IDLE_RECONNECT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                # Ohne dieses Timeout wartet readline() bei einem stillen
+                # Verbindungsabbruch (Box neu gestartet, NAT-Eintrag im Router
+                # verworfen) unbegrenzt auf Daten, die nie kommen: kein EOF,
+                # kein Fehler, kein Reconnect - die Integration wirkt dann
+                # eingeschlafen, bis man sie von Hand neu lädt.
+                if self._open_connections:
+                    # Ein laufendes Gespräch erzeugt selbst keine Zeilen. Hier
+                    # abzubrechen hieße, dessen DISCONNECT zu verpassen.
+                    _LOGGER.debug(
+                        "Keine Daten, aber %d offene Verbindung(en) - warte weiter",
+                        len(self._open_connections),
+                    )
+                    continue
+
+                raise ConnectionError(
+                    f"Seit {IDLE_RECONNECT_SECONDS} s keine Daten vom Call-Monitor"
+                ) from None
 
             if not raw_line:
                 # Leere Antwort = Verbindung wurde von der Gegenseite beendet
@@ -237,7 +369,34 @@ class FranzBoxCallMonitorClient:
             event = parse_call_monitor_line(line)
 
             if event is not None:
+                self._track_connection(event)
                 self._notify_listeners(event)
+
+    def _track_connection(self, event: CallEvent) -> None:
+        """Führt Buch über die gerade offenen Verbindungen.
+
+        Bewusst unabhängig vom Zustand des Sensors: der Client darf für seine
+        eigene Entscheidung (Idle-Reconnect ja/nein) nicht auf eine Entity
+        angewiesen sein, die es womöglich gar nicht gibt.
+        """
+        if event.event_type in ("RING", "CALL"):
+            self._open_connections.add(event.connection_id)
+        elif event.event_type == "DISCONNECT":
+            self._open_connections.discard(event.connection_id)
+
+    def _notify_connected(self) -> None:
+        """Meldet den (Neu-)Aufbau der Verbindung.
+
+        Anders als bei den Ereignis-Listenern wird hier direkt aufgerufen und
+        nicht in einen Task verpackt: das Aufräumen muss abgeschlossen sein,
+        bevor die erste Zeile der neuen Verbindung verarbeitet wird - sonst
+        räumte es einen gerade erst angelegten Historieneintrag mit weg.
+        """
+        for callback in self._connection_listeners:
+            try:
+                callback()
+            except Exception:  # noqa: BLE001 - einer darf die anderen nicht mitreißen
+                _LOGGER.exception("Fehler beim Melden der neuen Verbindung")
 
     def _notify_listeners(self, event: CallEvent) -> None:
         """Benachrichtigt alle registrierten Listener über ein neues Ereignis."""
